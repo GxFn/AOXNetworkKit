@@ -65,6 +65,11 @@ public final class CircuitBreaker: Sendable {
                     requestID: UUID().uuidString
                 )
             case .halfOpen:
+                if s.circuitState != .halfOpen {
+                    s.circuitState = .halfOpen
+                    s.halfOpenAttempts = 0
+                    logger.info("Circuit breaker → half-open")
+                }
                 guard s.halfOpenAttempts < halfOpenMaxAttempts else {
                     throw NetworkError.transport(
                         underlying: CircuitBreakerOpenError(),

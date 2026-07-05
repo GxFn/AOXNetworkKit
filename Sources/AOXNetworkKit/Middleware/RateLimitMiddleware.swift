@@ -29,7 +29,7 @@ public struct RateLimitMiddleware: Middleware {
     }
 
     public func adapt(_ request: URLRequest, context: RequestContext) async throws -> URLRequest {
-        await bucket.acquire()
+        try await bucket.acquire()
         return request
     }
 }
@@ -52,7 +52,7 @@ final class TokenBucket: Sendable {
     }
 
     /// 消耗一个令牌，如果不够则等待
-    func acquire() async {
+    func acquire() async throws {
         let waitTime: TimeInterval = state.withLock { s in
             refill(&s)
             if s.tokens >= 1 {
@@ -66,7 +66,7 @@ final class TokenBucket: Sendable {
 
         if waitTime > 0 {
             logger.debug("Rate limit: waiting \(String(format: "%.1f", waitTime * 1000))ms")
-            try? await Task.sleep(for: .seconds(waitTime))
+            try await Task.sleep(for: .seconds(waitTime))
             // 等待后扣减令牌
             state.withLock { s in
                 refill(&s)

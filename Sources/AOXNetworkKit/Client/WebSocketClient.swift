@@ -112,8 +112,14 @@ public final actor WebSocketClient {
     /// 改为乐观启动接收循环：handshake 成功 → receive() 正常返回数据；
     /// 失败 → receive() 抛错 → handleDisconnect 处理重连。
     public func connect() async throws {
+        try await connect(resetReconnectCount: true)
+    }
+
+    private func connect(resetReconnectCount: Bool) async throws {
         intentionalDisconnect = false
-        reconnectCount = 0
+        if resetReconnectCount {
+            reconnectCount = 0
+        }
 
         var request = URLRequest(url: url)
         for (key, value) in headers {
@@ -187,9 +193,17 @@ public final actor WebSocketClient {
 
     /// 发送 ping
     public func ping() async throws {
+        guard let task, state == .connected else {
+            logger.warning("WebSocket ping skipped: not connected, url=\(self.url.absoluteString)")
+            throw NetworkError.transport(
+                underlying: URLError(.notConnectedToInternet),
+                requestID: UUID().uuidString
+            )
+        }
+
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
             let once = ContinuationOnceGuard(cont)
-            task?.sendPing { error in
+            task.sendPing { error in
                 if let error {
                     once.resume(throwing: error)
                 } else {
@@ -256,7 +270,11 @@ public final actor WebSocketClient {
         Task {
             try? await Task.sleep(for: .seconds(delay))
             guard !self.intentionalDisconnect else { return }
-            try? await self.connect()
+            do {
+                try await self.connect(resetReconnectCount: false)
+            } catch {
+                await self.handleDisconnect(error: error)
+            }
         }
     }
 

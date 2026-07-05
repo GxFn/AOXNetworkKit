@@ -145,6 +145,9 @@ public struct NetworkClient: NetworkClientProtocol {
 
         } catch let error as NetworkError {
             return try await attemptBusinessRecovery(from: error, endpoint: endpoint, context: context)
+        } catch is CancellationError {
+            logger.debug("[\(context.id.prefix(8))] Request cancelled: \(endpoint.path)")
+            throw CancellationError()
         } catch {
             let networkError = NetworkError.transport(underlying: error, requestID: context.id)
             return try await attemptBusinessRecovery(from: networkError, endpoint: endpoint, context: context)
