@@ -189,6 +189,13 @@ public final actor WebSocketClient {
         continuations.removeValue(forKey: id)
     }
 
+    /// 连接稳定（已收到数据）后重置重连计数，使后续断线可重新获得完整重连预算
+    private func resetReconnectCount() {
+        guard reconnectCount != 0 else { return }
+        logger.info("WebSocket stable after reconnect, reset reconnect count (was \(self.reconnectCount))")
+        reconnectCount = 0
+    }
+
     // MARK: - Ping
 
     /// 发送 ping
@@ -219,10 +226,19 @@ public final actor WebSocketClient {
         guard let task else { return }
 
         receiveLoopTask = Task { [weak self] in
+            // 每个连接的接收循环独立；收到首条消息即视为「本次连接稳定」，重置重连计数。
+            // 旧实现只在 public connect() 里重置，重连走 resetReconnectCount:false 从不清零，
+            // 累计到 maxReconnectAttempts 后即便每次重连都成功也会永久放弃。
+            // 放在「收到数据」而非「connected」处重置：避免一连上就断的抖动连接绕过最大重连次数。
+            var didMarkStable = false
             while !Task.isCancelled {
                 do {
                     let message = try await task.receive()
                     guard let self else { break }
+                    if !didMarkStable {
+                        didMarkStable = true
+                        await self.resetReconnectCount()
+                    }
                     let wsMessage: WebSocketMessage
                     switch message {
                     case .string(let text):

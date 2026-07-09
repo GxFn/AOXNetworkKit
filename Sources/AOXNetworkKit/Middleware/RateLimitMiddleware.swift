@@ -53,25 +53,20 @@ final class TokenBucket: Sendable {
 
     /// 消耗一个令牌，如果不够则等待
     func acquire() async throws {
+        // 关键：在锁内「预扣」令牌（允许扣成负数），据此计算等待时间。
+        // 旧实现只算 deficit、不预扣，睡醒后才 -1：并发请求会读到相同 deficit、睡相同时长后
+        // 同时放行，突发量远超 tokensPerSecond。预扣后，后到的请求 deficit 更大 → 等更久 → 自然错峰。
         let waitTime: TimeInterval = state.withLock { s in
             refill(&s)
-            if s.tokens >= 1 {
-                s.tokens -= 1
-                return 0
-            }
-            // 需要等待的时间
             let deficit = 1.0 - s.tokens
-            return deficit / tokensPerSecond
+            s.tokens -= 1  // 预扣（可为负），后续 refill 会随时间把欠账补回
+            return deficit > 0 ? deficit / tokensPerSecond : 0
         }
 
         if waitTime > 0 {
             logger.debug("Rate limit: waiting \(String(format: "%.1f", waitTime * 1000))ms")
             try await Task.sleep(for: .seconds(waitTime))
-            // 等待后扣减令牌
-            state.withLock { s in
-                refill(&s)
-                s.tokens = max(s.tokens - 1, 0)
-            }
+            // 令牌已在锁内预扣，睡醒后不再重复扣减
         }
     }
 

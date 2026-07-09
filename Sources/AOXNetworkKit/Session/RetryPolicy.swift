@@ -38,7 +38,9 @@ public final class NetworkKitRetryPolicy: RetryPolicy {
             retryLimit: retryLimit,
             exponentialBackoffBase: exponentialBackoffBase,
             exponentialBackoffScale: exponentialBackoffScale,
-            retryableHTTPMethods: RetryPolicy.defaultRetryableHTTPMethods.union([.post]),
+            // 不把 POST 纳入可重试：Alamofire 默认因幂等性排除 POST，
+            // 若重试「超时但服务端已成功」的写请求（点赞/投币/评论/发弹幕）会产生重复副作用。
+            retryableHTTPMethods: RetryPolicy.defaultRetryableHTTPMethods,
             retryableHTTPStatusCodes: RetryPolicy.defaultRetryableHTTPStatusCodes.union([429]),
             retryableURLErrorCodes: RetryPolicy.defaultRetryableURLErrorCodes
         )
