@@ -1,0 +1,35 @@
+name: iOS CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Swift 6 toolchain and lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+          test "$(xcodebuild -version | awk 'NR == 1 { split($2, v, "."); print v[1] }')" -ge 16
+          test "$(swift --version | awk '/Apple Swift version/ { split($4, v, "."); print v[1] }')" -ge 6
+          test -f Package.resolved
+      - name: Test AOXNetworkKit
+        run: >-
+          xcodebuild
+          -scheme AOXNetworkKit
+          -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest'
+          -onlyUsePackageVersionsFromResolvedFile
+          CODE_SIGNING_ALLOWED=NO
+          test
+      - name: Verify resolution stayed locked
+        run: git diff --exit-code -- Package.resolved

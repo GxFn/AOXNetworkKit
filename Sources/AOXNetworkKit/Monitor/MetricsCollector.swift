@@ -84,23 +84,31 @@ public protocol MetricsDelegate: AnyObject, Sendable {
 /// ```
 public final class MetricsCollector: Sendable {
 
+    /// 锁只保护盒子内部的 weak 引用；不能把 existential 直接放进锁状态，
+    /// 否则公开属性即使写成 `weak`，实际仍会被锁内 Optional 强持有。
+    private final class WeakDelegateBox: @unchecked Sendable {
+        weak var value: (any MetricsDelegate)?
+    }
+
     private let maxHistory: Int
     private let state: OSAllocatedUnfairLock<[RequestMetrics]>
 
-    public weak var delegate: (any MetricsDelegate)? {
-        get { _delegate.withLock { $0 } }
-        set { _delegate.withLock { $0 = newValue } }
+    public var delegate: (any MetricsDelegate)? {
+        get { delegateState.withLock { $0.value } }
+        set { delegateState.withLock { $0.value = newValue } }
     }
-    private let _delegate: OSAllocatedUnfairLock<(any MetricsDelegate)?> = .init(initialState: nil)
+    private let delegateState = OSAllocatedUnfairLock<WeakDelegateBox>(initialState: WeakDelegateBox())
 
     public init(maxHistory: Int = 500) {
-        self.maxHistory = maxHistory
+        // 外部配置可能来自远端或 UserDefaults；负数不能传入 removeFirst 形成越界崩溃。
+        self.maxHistory = max(0, maxHistory)
         self.state = OSAllocatedUnfairLock(initialState: [])
     }
 
     /// 记录一次请求指标
     public func record(_ metrics: RequestMetrics) {
         state.withLock { history in
+            guard self.maxHistory > 0 else { return }
             history.append(metrics)
             if history.count > self.maxHistory {
                 history.removeFirst(history.count - self.maxHistory)
@@ -109,7 +117,10 @@ public final class MetricsCollector: Sendable {
         delegate?.metricsCollector(self, didRecord: metrics)
 
         if !metrics.succeeded {
-            logger.debug("Request failed: \(metrics.path) (\(metrics.errorType ?? "unknown"))")
+            // path 可能包含房间号、用户 id 等业务标识；日志只保留方法和稳定错误分类。
+            logger.debug(
+                "Request failed: method=\(metrics.method), category=\(metrics.errorType ?? "unknown")"
+            )
         }
     }
 
@@ -134,8 +145,10 @@ public final class MetricsCollector: Sendable {
         let p95Index = Int(Double(sorted.count) * 0.95)
         let p95 = sorted[min(p95Index, sorted.count - 1)]
 
-        let bytesSent = history.reduce(Int64(0)) { $0 + $1.bytesSent }
-        let bytesReceived = history.reduce(Int64(0)) { $0 + $1.bytesReceived }
+        // 单个 URLSession task 已做饱和求和；历史聚合仍必须再次防溢出，
+        // 否则多个大请求会在 Debug 下 trap、Release 下回绕成负流量。
+        let bytesSent = Self.saturatingNonnegativeSum(history.map(\.bytesSent))
+        let bytesReceived = Self.saturatingNonnegativeSum(history.map(\.bytesReceived))
 
         return AggregatedStats(
             totalRequests: history.count,
@@ -156,5 +169,13 @@ public final class MetricsCollector: Sendable {
     /// 清空历史
     public func reset() {
         state.withLock { $0.removeAll() }
+    }
+
+    private static func saturatingNonnegativeSum(_ values: [Int64]) -> Int64 {
+        values.reduce(into: Int64(0)) { total, value in
+            let nonnegativeValue = max(0, value)
+            let (sum, overflow) = total.addingReportingOverflow(nonnegativeValue)
+            total = overflow ? .max : sum
+        }
     }
 }

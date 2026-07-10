@@ -30,6 +30,11 @@ enum WebSocketTransportError: LocalizedError, Sendable, Equatable {
             return "WebSocket async gate only supports one waiter"
         }
     }
+
+    var closeInfo: WebSocketCloseInfo? {
+        guard case .closed(let code, let reason) = self else { return nil }
+        return WebSocketCloseInfo(code: code, reason: reason)
+    }
 }
 
 /// 可在回调早于 async 等待注册时保存结果的一次性门闩。
@@ -138,8 +143,19 @@ final class WebSocketSessionDelegate: NSObject, URLSessionWebSocketDelegate, @un
         task: URLSessionTask,
         didCompleteWithError error: (any Error)?
     ) {
-        guard task is URLSessionWebSocketTask else { return }
-        let terminalError = error ?? WebSocketTransportError.transportCompleted
+        guard let webSocketTask = task as? URLSessionWebSocketTask else { return }
+
+        // 部分系统/代理链只回调 didComplete，没有先回调 didClose。此时仍从 task 提取
+        // closeCode/closeReason，避免上层最终只看到笼统的 transportCompleted。
+        let terminalError: any Error
+        if webSocketTask.closeCode != .invalid {
+            terminalError = WebSocketTransportError.closed(
+                code: webSocketTask.closeCode.rawValue,
+                reason: webSocketTask.closeReason.flatMap { String(data: $0, encoding: .utf8) }
+            )
+        } else {
+            terminalError = error ?? WebSocketTransportError.transportCompleted
+        }
         handshakeGate.resolve(.failure(terminalError))
         notifyTerminationOnce(terminalError)
     }
@@ -166,6 +182,24 @@ public enum WebSocketState: Sendable, Equatable {
     case connecting
     case connected
     case disconnected(reason: String?)
+}
+
+/// 最近一次远端 WebSocket 关闭信息。
+///
+/// `reason` 保留给业务层判断服务端下线、鉴权过期等语义，但不会写入网络层日志。
+/// `code == 1000` 表示 RFC 6455 正常关闭，其余代码由调用方按协议决定是否重试或提示用户。
+public struct WebSocketCloseInfo: Sendable, Equatable {
+    public let code: Int
+    public let reason: String?
+
+    public init(code: Int, reason: String?) {
+        self.code = code
+        self.reason = reason
+    }
+
+    public var isNormalClosure: Bool {
+        code == URLSessionWebSocketTask.CloseCode.normalClosure.rawValue
+    }
 }
 
 /// WebSocket 客户端
@@ -216,6 +250,9 @@ public final actor WebSocketClient {
     private var subscribers: [UUID: Subscriber] = [:]
 
     private(set) public var state: WebSocketState = .disconnected(reason: nil)
+    /// 最近一次由远端发送的结构化 close 信息；重连不会立即清空，便于上层读取失败原因。
+    private(set) public var lastRemoteClose: WebSocketCloseInfo?
+    private var lastRemoteCloseGeneration: UInt64 = 0
 
     public init(
         url: URL,
@@ -275,7 +312,7 @@ public final actor WebSocketClient {
             reason: reason ?? "intentional",
             closeCode: .normalClosure
         )
-        finishAllStreams(reason: reason ?? "intentional disconnect")
+        finishAllStreams()
     }
 
     // MARK: - Send
@@ -352,7 +389,7 @@ public final actor WebSocketClient {
     public func ping() async throws {
         guard let task, let generation = activeGeneration, state == .connected else {
             logger.warning(
-                "WebSocket ping rejected: state=not-connected, host=\(self.url.host ?? "unknown"), path=\(self.url.path)"
+                "WebSocket ping rejected: state=not-connected, host=\(self.url.host ?? "unknown")"
             )
             throw notConnectedError()
         }
@@ -387,7 +424,7 @@ public final actor WebSocketClient {
             throw CancellationError()
         } catch {
             logger.error(
-                "WebSocket ping failed: generation=\(generation), host=\(self.url.host ?? "unknown"), error=\(error.localizedDescription)"
+                "WebSocket ping failed: generation=\(generation), host=\(self.url.host ?? "unknown"), category=\(Self.diagnosticCategory(for: error))"
             )
             handleTransportFailure(
                 generation: generation,
@@ -466,7 +503,7 @@ public final actor WebSocketClient {
 
         webSocketTask.resume()
         logger.info(
-            "WebSocket handshake started: generation=\(generation), host=\(self.url.host ?? "unknown"), path=\(self.url.path)"
+            "WebSocket handshake started: generation=\(generation), host=\(self.url.host ?? "unknown")"
         )
 
         let timeout = handshakeTimeout
@@ -519,7 +556,7 @@ public final actor WebSocketClient {
 
         state = .connected
         logger.info(
-            "WebSocket handshake completed: generation=\(generation), host=\(self.url.host ?? "unknown"), path=\(self.url.path)"
+            "WebSocket handshake completed: generation=\(generation), host=\(self.url.host ?? "unknown")"
         )
         startReceiveLoop(task: webSocketTask, generation: generation)
     }
@@ -625,16 +662,25 @@ public final actor WebSocketClient {
         error: any Error,
         source: String
     ) {
+        // receive / delegate 回调存在竞争：通用 receive 错误可能先关闭 transport，随后才收到
+        // 带 code/reason 的 didClose。即使后者已变成 stale，也应补录同代结构化关闭信息；
+        // generation 检查同时防止更旧的迟到回调覆盖新连接的关闭原因。
+        if let closeInfo = (error as? WebSocketTransportError)?.closeInfo,
+           generation >= lastRemoteCloseGeneration {
+            lastRemoteClose = closeInfo
+            lastRemoteCloseGeneration = generation
+        }
+
         guard activeGeneration == generation else {
             logger.debug(
-                "WebSocket ignored stale failure: source=\(source), generation=\(generation), active=\(self.activeGeneration ?? 0), error=\(error.localizedDescription)"
+                "WebSocket ignored stale failure: source=\(source), generation=\(generation), active=\(self.activeGeneration ?? 0), category=\(Self.diagnosticCategory(for: error))"
             )
             return
         }
 
         let reason = error.localizedDescription
         logger.error(
-            "WebSocket transport failed: source=\(source), generation=\(generation), error=\(reason)"
+            "WebSocket transport failed: source=\(source), generation=\(generation), category=\(Self.diagnosticCategory(for: error))"
         )
         // 失败回调可能早于 runConnectionAttempt 的 await/catch 返回（尤其重连延迟为 0 时）。
         // 先释放同代 attempt，确保马上触发的重连不会再次等待已经失败的旧 Task。
@@ -649,17 +695,17 @@ public final actor WebSocketClient {
             logger.info(
                 "WebSocket reconnect stopped: intentional=\(self.intentionalDisconnect), enabled=\(self.autoReconnect), count=\(self.reconnectCount), max=\(self.maxReconnectAttempts)"
             )
-            finishAllStreams(reason: reason)
+            finishAllStreams()
             return
         }
 
-        scheduleReconnect(reason: reason)
+        scheduleReconnect()
     }
 
-    private func scheduleReconnect(reason: String) {
+    private func scheduleReconnect() {
         guard reconnectTask == nil else {
             logger.debug(
-                "WebSocket reconnect already scheduled; duplicate ignored: reason=\(reason)"
+                "WebSocket reconnect already scheduled; duplicate ignored"
             )
             return
         }
@@ -717,7 +763,7 @@ public final actor WebSocketClient {
         } catch {
             // establishConnection 已负责清理和安排下一次重连，此处仅补足诊断。
             logger.error(
-                "WebSocket reconnect attempt failed: attempt=\(attemptNumber), schedule=\(scheduleGeneration), error=\(error.localizedDescription)"
+                "WebSocket reconnect attempt failed: attempt=\(attemptNumber), schedule=\(scheduleGeneration), category=\(Self.diagnosticCategory(for: error))"
             )
         }
     }
@@ -754,11 +800,11 @@ public final actor WebSocketClient {
         oldTask?.cancel(with: closeCode, reason: reason.data(using: .utf8))
         oldSession?.invalidateAndCancel()
         logger.info(
-            "WebSocket transport closed: generation=\(oldGeneration ?? 0), reason=\(reason)"
+            "WebSocket transport closed: generation=\(oldGeneration ?? 0)"
         )
     }
 
-    private func finishAllStreams(reason: String) {
+    private func finishAllStreams() {
         guard !subscribers.isEmpty else { return }
         let subscriberCount = subscribers.count
         for subscriber in subscribers.values {
@@ -766,8 +812,33 @@ public final actor WebSocketClient {
         }
         subscribers.removeAll()
         logger.info(
-            "WebSocket streams finished: subscribers=\(subscriberCount), reason=\(reason)"
+            "WebSocket streams finished: subscribers=\(subscriberCount)"
         )
+    }
+
+    /// 日志只保留稳定类别和标准错误码，不记录 URL path、close reason 或系统错误正文。
+    private static func diagnosticCategory(for error: any Error) -> String {
+        if error is CancellationError {
+            return "cancelled"
+        }
+        if let transportError = error as? WebSocketTransportError {
+            switch transportError {
+            case .handshakeTimedOut:
+                return "handshake-timeout"
+            case .pingTimedOut:
+                return "ping-timeout"
+            case .closed(let code, _):
+                return "remote-close-\(code)"
+            case .transportCompleted:
+                return "transport-completed"
+            case .duplicateWaiter:
+                return "duplicate-waiter"
+            }
+        }
+        if let urlError = error as? URLError {
+            return "url-error-\(urlError.code.rawValue)"
+        }
+        return "transport"
     }
 
     private func notConnectedError() -> NetworkError {

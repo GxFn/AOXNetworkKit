@@ -36,4 +36,17 @@ public struct SigningMiddleware: Middleware {
         mutableRequest.url = signedURL
         return mutableRequest
     }
+
+    public func recover(from error: NetworkError, context: RequestContext) async throws -> RecoveryAction? {
+        guard context.requiresSigning,
+              context.retryCount == 0,
+              let recoverableSigner = signer as? any RecoverableRequestSigner else {
+            return nil
+        }
+
+        // 最多只允许签名器主动刷新一次。下一轮 execute 会重新经过 adapt，生成新签名；
+        // 若仍被拒绝则直接把真实业务错误交给上层，不能形成风控请求放大。
+        guard await recoverableSigner.prepareRetry(after: error) else { return nil }
+        return .retry(after: 0)
+    }
 }

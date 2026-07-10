@@ -9,6 +9,9 @@
 - **Multi-Session 连接池** — 按优先级分流到独立 URLSession（standard / realtime / prefetch）
 - **统一错误类型** — `NetworkError` 区分可重试/不可重试，携带 requestID 日志追踪
 - **协议抽象** — `RequestSigner`、`ResponseValidatable`、`NetworkClientProtocol` 全面可 Mock
+- **可靠下载状态机** — 多等待者、pause/resume 代次、显式取消与终态缓存
+- **WebSocket 诊断** — 握手后连接态、有界缓冲、远端 close code/reason 和过期回调隔离
+- **单次指标记账** — 每个 DataRequest 只生成一个成功/失败指标，避免多 serializer 重复统计
 
 ## 要求
 
@@ -42,6 +45,19 @@ let client = NetworkClient(
     middlewares: [RetryMiddleware(), LogMiddleware()]
 )
 let response = try await client.send(.fetchItems(page: 1))
+```
+
+## 验证
+
+仓库提交 `Package.resolved`，CI 只使用锁定的 Alamofire revision：
+
+```bash
+xcodebuild \
+  -scheme AOXNetworkKit \
+  -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+  -onlyUsePackageVersionsFromResolvedFile \
+  CODE_SIGNING_ALLOWED=NO \
+  test
 ```
 
 ## 架构

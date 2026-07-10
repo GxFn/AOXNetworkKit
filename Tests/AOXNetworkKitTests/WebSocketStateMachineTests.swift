@@ -104,6 +104,13 @@ final class WebSocketStateMachineTests: XCTestCase {
 
         XCTAssertEqual(recorder.count, 1)
         XCTAssertEqual(recorder.lastGeneration, 11)
+        XCTAssertEqual(
+            recorder.lastCloseInfo,
+            WebSocketCloseInfo(
+                code: URLSessionWebSocketTask.CloseCode.goingAway.rawValue,
+                reason: "server restart"
+            )
+        )
 
         do {
             try await gate.wait()
@@ -118,6 +125,27 @@ final class WebSocketStateMachineTests: XCTestCase {
         }
         task.cancel(with: .normalClosure, reason: nil)
     }
+
+    func testStructuredCloseInfoDistinguishesNormalAndAbnormalClosure() {
+        let normal = WebSocketCloseInfo(
+            code: URLSessionWebSocketTask.CloseCode.normalClosure.rawValue,
+            reason: nil
+        )
+        let policyViolation = WebSocketTransportError.closed(
+            code: URLSessionWebSocketTask.CloseCode.policyViolation.rawValue,
+            reason: "authentication expired"
+        ).closeInfo
+
+        XCTAssertTrue(normal.isNormalClosure)
+        XCTAssertEqual(
+            policyViolation,
+            WebSocketCloseInfo(
+                code: URLSessionWebSocketTask.CloseCode.policyViolation.rawValue,
+                reason: "authentication expired"
+            )
+        )
+        XCTAssertFalse(policyViolation?.isNormalClosure == true)
+    }
 }
 
 private final class TerminationRecorder: @unchecked Sendable {
@@ -130,6 +158,12 @@ private final class TerminationRecorder: @unchecked Sendable {
 
     var lastGeneration: UInt64? {
         lock.withLock { records.last?.generation }
+    }
+
+    var lastCloseInfo: WebSocketCloseInfo? {
+        lock.withLock {
+            (records.last?.error as? WebSocketTransportError)?.closeInfo
+        }
     }
 
     func record(generation: UInt64, error: any Error) {

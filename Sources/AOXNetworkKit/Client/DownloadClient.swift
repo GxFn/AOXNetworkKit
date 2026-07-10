@@ -129,6 +129,8 @@ public final class DownloadClient: Sendable {
 /// 支持 pause / resume / cancel，暂停时自动持久化 resumeData。
 public final actor DownloadTask {
 
+    private typealias ResultContinuation = CheckedContinuation<DownloadResult, any Error>
+
     private let remoteURL: URL
     private let destination: URL
     private let resumeDataURL: URL
@@ -137,11 +139,31 @@ public final actor DownloadTask {
     private let progress: DownloadProgress?
 
     private var downloadRequest: DownloadRequest?
-    private var continuation: CheckedContinuation<DownloadResult, any Error>?
+    /// `result` 允许多个调用方同时等待；每个等待者都必须独立处理取消，不能互相覆盖。
+    private var resultWaiters: [UUID: ResultContinuation] = [:]
+    /// 下载句柄只有一个终态。缓存结果后，重复读取 `result` 必须立即返回同一结果，不能重启请求。
+    private var terminalOutcome: Result<DownloadResult, any Error>?
+    /// Alamofire 取消/完成回调可能晚于下一次 resume，generation 用于丢弃旧请求的回调。
+    private var operationGeneration: UInt64 = 0
     private var state: TaskState = .idle
 
     private enum TaskState {
-        case idle, downloading, paused, completed, cancelled, failed
+        case idle
+        case downloading(generation: UInt64)
+        case pausing(generation: UInt64, shouldResume: Bool)
+        case paused
+        case completed
+        case cancelled
+        case failed
+
+        var isTerminal: Bool {
+            switch self {
+            case .completed, .cancelled, .failed:
+                return true
+            case .idle, .downloading, .pausing, .paused:
+                return false
+            }
+        }
     }
 
     init(
@@ -163,41 +185,96 @@ public final actor DownloadTask {
     /// 等待下载完成
     public var result: DownloadResult {
         get async throws {
-            try await withCheckedThrowingContinuation { cont in
-                self.continuation = cont
-                self.startOrResume()
+            try Task.checkCancellation()
+            let waiterID = UUID()
+
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    // cancellation handler 可能已排队，但 actor 尚未让出执行权；这里再检查一次，
+                    // 保证“注册前取消”也不会留下永远无法恢复的 continuation。
+                    guard !Task.isCancelled else {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+
+                    if let terminalOutcome {
+                        continuation.resume(with: terminalOutcome)
+                        return
+                    }
+
+                    resultWaiters[waiterID] = continuation
+                    if case .idle = state {
+                        startNewAttempt()
+                    }
+                }
+            } onCancel: {
+                // 取消某个等待者只终止该等待；共享下载及其他等待者不受影响。
+                // 如需取消整个下载，调用方应显式调用 `cancel()`。
+                Task { await self.cancelWaiter(id: waiterID) }
             }
         }
     }
 
     /// 暂停下载（保存 resumeData 以便续传）
     public func pause() {
-        guard state == .downloading, let request = downloadRequest else { return }
-        state = .paused
+        guard case .downloading(let generation) = state,
+              let request = downloadRequest else {
+            return
+        }
+
+        // 先进入 pausing，再触发 Alamofire 取消。即使完成回调极快到达，也能识别为暂停路径。
+        state = .pausing(generation: generation, shouldResume: false)
         request.cancel(producingResumeData: true)
-        logger.info("Download paused: \(self.remoteURL.lastPathComponent)")
+        logger.info(
+            "Download pause requested: generation=\(generation), host=\(self.remoteURL.host ?? "unknown")"
+        )
     }
 
     /// 恢复下载
     public func resume() {
-        guard state == .paused else { return }
-        startOrResume()
+        switch state {
+        case .paused:
+            startNewAttempt()
+
+        case .pausing(let generation, _):
+            // resumeData 由旧请求的完成回调产生。立即 resume 时先记下意图，等保存完成后再启动，
+            // 避免旧取消回调误伤新请求，也避免在 resumeData 尚未落盘时从零重复下载。
+            state = .pausing(generation: generation, shouldResume: true)
+            logger.info(
+                "Download resume queued while pausing: generation=\(generation), host=\(self.remoteURL.host ?? "unknown")"
+            )
+
+        case .idle, .downloading, .completed, .cancelled, .failed:
+            return
+        }
     }
 
     /// 取消下载（清理 resumeData）
     public func cancel() {
+        guard !state.isTerminal else { return }
+
+        // 先递增 generation 并清空当前请求，再触发取消；晚到回调只会命中 stale 分支。
+        operationGeneration &+= 1
+        let request = downloadRequest
+        downloadRequest = nil
         state = .cancelled
-        downloadRequest?.cancel()
+        request?.cancel()
         cleanResumeData()
-        continuation?.resume(throwing: CancellationError())
-        continuation = nil
-        logger.info("Download cancelled: \(self.remoteURL.lastPathComponent)")
+        finish(
+            with: .failure(CancellationError()),
+            terminalState: .cancelled
+        )
+        logger.info("Download cancelled: host=\(self.remoteURL.host ?? "unknown")")
     }
 
     // MARK: - Internal
 
-    private func startOrResume() {
-        state = .downloading
+    private func startNewAttempt() {
+        guard terminalOutcome == nil else { return }
+
+        operationGeneration &+= 1
+        let generation = operationGeneration
+        state = .downloading(generation: generation)
 
         let afDestination: DownloadRequest.Destination = { [destination] _, _ in
             (destination, [.removePreviousFile, .createIntermediateDirectories])
@@ -209,7 +286,9 @@ public final actor DownloadTask {
         if let resumeData = loadResumeData() {
             request = session.download(resumingWith: resumeData, to: afDestination)
                 .validate(statusCode: 200..<300)
-            logger.info("Download resuming: \(self.remoteURL.lastPathComponent) (\(resumeData.count) bytes resume data)")
+            logger.info(
+                "Download resuming: generation=\(generation), host=\(self.remoteURL.host ?? "unknown"), resumeBytes=\(resumeData.count)"
+            )
         } else {
             var httpHeaders: HTTPHeaders?
             if let headers {
@@ -217,80 +296,182 @@ public final actor DownloadTask {
             }
             request = session.download(remoteURL, headers: httpHeaders, to: afDestination)
                 .validate(statusCode: 200..<300)
-            logger.info("Download starting: \(self.remoteURL.lastPathComponent)")
+            logger.info(
+                "Download starting: generation=\(generation), host=\(self.remoteURL.host ?? "unknown")"
+            )
         }
 
-        // 进度回调
+        // 进度回调也校验 generation，防止 pause/resume 后旧请求的进度覆盖新请求。
         if let progress {
-            request.downloadProgress { p in
-                let state = DownloadState(
-                    completedBytes: p.completedUnitCount,
-                    totalBytes: p.totalUnitCount > 0 ? p.totalUnitCount : nil
-                )
-                progress(state)
+            request.downloadProgress { [weak self] value in
+                let completedBytes = value.completedUnitCount
+                let totalBytes = value.totalUnitCount > 0 ? value.totalUnitCount : nil
+                Task { [weak self] in
+                    await self?.handleProgress(
+                        completedBytes: completedBytes,
+                        totalBytes: totalBytes,
+                        generation: generation,
+                        callback: progress
+                    )
+                }
             }
         }
 
         // 完成回调
         request.response { [weak self] response in
             guard let self else { return }
-            Task { await self.handleCompletion(response) }
+            Task { await self.handleCompletion(response, generation: generation) }
         }
 
         self.downloadRequest = request
     }
 
-    private func handleCompletion(_ response: AFDownloadResponse<URL?>) {
-        switch state {
-        case .cancelled:
-            return  // 已处理
-
-        case .downloading, .paused:
-            if let error = response.error {
-                // 暂停产生的取消 → 保存 resumeData
-                if let resumeData = response.resumeData, state == .paused || error.isExplicitlyCancelledError {
-                    saveResumeData(resumeData)
-                    // paused 状态不 resume continuation，等 resume() 调用
-                    if state == .paused { return }
-                }
-
-                state = .failed
-                let networkError = NetworkError.from(
-                    afError: error,
-                    response: response.response,
-                    data: nil,
-                    requestID: UUID().uuidString
-                )
-                continuation?.resume(throwing: networkError)
-                continuation = nil
-                logger.error("Download failed: \(self.remoteURL.lastPathComponent) — \(error.localizedDescription)")
-                return
-            }
-
-            guard let fileURL = response.fileURL else {
-                state = .failed
-                let error = NetworkError.transport(
-                    underlying: URLError(.cannotCreateFile),
-                    requestID: UUID().uuidString
-                )
-                continuation?.resume(throwing: error)
-                continuation = nil
-                return
-            }
-
-            // 成功
-            state = .completed
-            cleanResumeData()
-
-            let fileSize = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int64) ?? 0
-            let result = DownloadResult(fileURL: fileURL, fileSize: fileSize)
-            continuation?.resume(returning: result)
-            continuation = nil
-            logger.info("Download complete: \(self.remoteURL.lastPathComponent) (\(fileSize) bytes)")
-
-        default:
-            break
+    private func handleProgress(
+        completedBytes: Int64,
+        totalBytes: Int64?,
+        generation: UInt64,
+        callback: DownloadProgress
+    ) {
+        guard case .downloading(let activeGeneration) = state,
+              activeGeneration == generation else {
+            return
         }
+
+        callback(DownloadState(completedBytes: completedBytes, totalBytes: totalBytes))
+    }
+
+    private func handleCompletion(
+        _ response: AFDownloadResponse<URL?>,
+        generation: UInt64
+    ) {
+        switch state {
+        case .downloading(let activeGeneration) where activeGeneration == generation:
+            downloadRequest = nil
+            handleActiveCompletion(response, generation: generation)
+
+        case .pausing(let activeGeneration, let shouldResume) where activeGeneration == generation:
+            downloadRequest = nil
+            handlePauseCompletion(
+                response,
+                generation: generation,
+                shouldResume: shouldResume
+            )
+
+        case .idle, .paused, .completed, .cancelled, .failed, .downloading, .pausing:
+            logger.debug(
+                "Download ignored stale completion: generation=\(generation), current=\(self.operationGeneration), host=\(self.remoteURL.host ?? "unknown")"
+            )
+        }
+    }
+
+    private func handleActiveCompletion(
+        _ response: AFDownloadResponse<URL?>,
+        generation: UInt64
+    ) {
+        if let error = response.error {
+            let networkError = NetworkError.from(
+                afError: error,
+                response: response.response,
+                data: nil,
+                requestID: UUID().uuidString
+            )
+            finish(with: .failure(networkError), terminalState: .failed)
+            // 不记录 URL、目标路径、请求头或错误正文，避免日志泄漏用户内容和鉴权信息。
+            logger.error(
+                "Download failed: generation=\(generation), host=\(self.remoteURL.host ?? "unknown"), category=transport"
+            )
+            return
+        }
+
+        guard let fileURL = response.fileURL else {
+            let error = NetworkError.transport(
+                underlying: URLError(.cannotCreateFile),
+                requestID: UUID().uuidString
+            )
+            finish(with: .failure(error), terminalState: .failed)
+            logger.error(
+                "Download failed without destination file: generation=\(generation), host=\(self.remoteURL.host ?? "unknown")"
+            )
+            return
+        }
+
+        complete(fileURL: fileURL, generation: generation)
+    }
+
+    private func handlePauseCompletion(
+        _ response: AFDownloadResponse<URL?>,
+        generation: UInt64,
+        shouldResume: Bool
+    ) {
+        // 极小文件可能在 cancel 生效前已经完成；成功结果优先，不能退回 paused 后重复下载。
+        if response.error == nil, let fileURL = response.fileURL {
+            complete(fileURL: fileURL, generation: generation)
+            return
+        }
+
+        if let resumeData = response.resumeData {
+            saveResumeData(resumeData)
+        }
+
+        if let error = response.error,
+           !error.isExplicitlyCancelledError,
+           response.resumeData == nil {
+            let networkError = NetworkError.from(
+                afError: error,
+                response: response.response,
+                data: nil,
+                requestID: UUID().uuidString
+            )
+            finish(with: .failure(networkError), terminalState: .failed)
+            logger.error(
+                "Download failed while pausing: generation=\(generation), host=\(self.remoteURL.host ?? "unknown"), category=transport"
+            )
+            return
+        }
+
+        state = .paused
+        logger.info(
+            "Download paused: generation=\(generation), host=\(self.remoteURL.host ?? "unknown"), hasResumeData=\(response.resumeData != nil)"
+        )
+        if shouldResume {
+            startNewAttempt()
+        }
+    }
+
+    private func complete(fileURL: URL, generation: UInt64) {
+        cleanResumeData()
+        let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let fileSize = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+        let result = DownloadResult(fileURL: fileURL, fileSize: fileSize)
+        finish(with: .success(result), terminalState: .completed)
+        logger.info(
+            "Download complete: generation=\(generation), host=\(self.remoteURL.host ?? "unknown"), bytes=\(fileSize)"
+        )
+    }
+
+    private func finish(
+        with outcome: Result<DownloadResult, any Error>,
+        terminalState: TaskState
+    ) {
+        guard terminalOutcome == nil else { return }
+        terminalOutcome = outcome
+        state = terminalState
+        downloadRequest = nil
+
+        // 先复制再清空字典，避免迭代一个已被修改的 Dictionary.Values 视图。
+        let waiters = Array(resultWaiters.values)
+        resultWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume(with: outcome)
+        }
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let waiter = resultWaiters.removeValue(forKey: id) else { return }
+        waiter.resume(throwing: CancellationError())
+        logger.debug(
+            "Download waiter cancelled: remaining=\(self.resultWaiters.count), host=\(self.remoteURL.host ?? "unknown")"
+        )
     }
 
     // MARK: - Resume Data Persistence
@@ -300,7 +481,7 @@ public final actor DownloadTask {
             try data.write(to: resumeDataURL, options: .atomic)
             logger.debug("Resume data saved: \(data.count) bytes")
         } catch {
-            logger.warning("Failed to save resume data: \(error.localizedDescription)")
+            logger.warning("Failed to save resume data: category=file-system")
         }
     }
 
