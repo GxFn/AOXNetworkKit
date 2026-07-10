@@ -85,6 +85,16 @@ public final class CacheMiddleware: Middleware, @unchecked Sendable {
         pendingPolicies.withLock { $0[contextID] = policy }
     }
 
+    /// 请求无论成功、失败还是取消都由 NetworkClient defer 调用；成功路径可重复移除，保持幂等。
+    public func unregisterPolicy(for contextID: String) {
+        _ = pendingPolicies.withLock { $0.removeValue(forKey: contextID) }
+    }
+
+    /// 只读诊断数量，供回归测试确认失败/取消和 dedup follower 没有泄漏策略状态。
+    public var pendingPolicyCount: Int {
+        pendingPolicies.withLock { $0.count }
+    }
+
     /// 查询缓存
     public func cachedData(for url: URL) -> Data? {
         cachedData(for: Self.cacheKey(for: url))

@@ -76,19 +76,24 @@ public struct NetworkClient: NetworkClientProtocol {
         // 2. 熔断器预检 → 快速失败
         try circuitBreaker?.preCheck()
 
-        // 3. 注册缓存策略（didReceive 阶段使用）
-        let context = RequestContext(endpoint: endpoint)
-        registerCachePolicy(endpoint, context: context)
-
-        // 4. 执行请求（支持去重）
+        // 3. 执行请求（支持去重）。RequestContext 和缓存策略必须只由真正发网的 leader 创建；
+        // follower 若提前注册 side-table，会因为没有 didReceive 永久残留。
         if let deduplicator {
             return try await deduplicator.deduplicate(
-                key: Self.deduplicationKey(for: endpoint)
+                key: try Self.deduplicationKey(for: endpoint, defaultBaseURL: defaultBaseURL)
             ) {
-                try await self.executeWithCircuitBreaker(endpoint, context: context)
+                try await self.executeRegistered(endpoint)
             }
         }
 
+        return try await executeRegistered(endpoint)
+    }
+
+    /// 将缓存策略的注册与回收包在真实请求生命周期内，成功、失败、取消都不会留下 side-table。
+    private func executeRegistered<T: Decodable & Sendable>(_ endpoint: Endpoint<T>) async throws -> T {
+        let context = RequestContext(endpoint: endpoint)
+        registerCachePolicy(endpoint, context: context)
+        defer { unregisterCachePolicy(context: context) }
         return try await executeWithCircuitBreaker(endpoint, context: context)
     }
 
@@ -102,8 +107,13 @@ public struct NetworkClient: NetworkClientProtocol {
             let result = try await execute(endpoint, context: context)
             circuitBreaker?.recordSuccess()
             return result
+        } catch is CancellationError {
+            // 调用方主动取消不是服务故障，不能消耗熔断预算。
+            throw CancellationError()
         } catch {
-            circuitBreaker?.recordFailure()
+            if Self.shouldRecordCircuitFailure(error) {
+                circuitBreaker?.recordFailure()
+            }
             throw error
         }
     }
@@ -230,10 +240,10 @@ public struct NetworkClient: NetworkClientProtocol {
 
     /// 从内存缓存查找已缓存的响应
     private func checkCache<T: Decodable & Sendable>(for endpoint: Endpoint<T>) -> T? {
-        guard case .memory = endpoint.cachePolicy else { return nil }
+        guard endpoint.method == .get, case .memory = endpoint.cachePolicy else { return nil }
         guard let cache = middlewares.lazy.compactMap({ $0 as? CacheMiddleware }).first else { return nil }
-        let urlString = (endpoint.baseURL ?? defaultBaseURL) + endpoint.path
-        guard let url = URL(string: urlString) else { return nil }
+        // 缓存写入使用 HTTPURLResponse.url（包含 query）；读取必须使用同一规范化 URL。
+        guard let url = try? endpoint.asURLRequest(baseURL: defaultBaseURL).url else { return nil }
         guard let data = cache.cachedData(for: url) else { return nil }
         let context = RequestContext(endpoint: endpoint)
         return try? decoder.decode(T.self, from: data, context: context)
@@ -241,20 +251,71 @@ public struct NetworkClient: NetworkClientProtocol {
 
     /// 向 CacheMiddleware 注册缓存策略（didReceive 阶段使用）
     private func registerCachePolicy<T>(_ endpoint: Endpoint<T>, context: RequestContext) {
-        guard case .memory = endpoint.cachePolicy else { return }
+        guard endpoint.method == .get, case .memory = endpoint.cachePolicy else { return }
         guard let cache = middlewares.lazy.compactMap({ $0 as? CacheMiddleware }).first else { return }
         cache.registerPolicy(endpoint.cachePolicy, for: context.id)
     }
 
+    private func unregisterCachePolicy(context: RequestContext) {
+        for cache in middlewares.lazy.compactMap({ $0 as? CacheMiddleware }) {
+            cache.unregisterPolicy(for: context.id)
+        }
+    }
+
     // MARK: - Deduplication
 
-    /// 生成去重 key：method + path + 排序后的参数
-    private static func deduplicationKey<T>(for endpoint: Endpoint<T>) -> String {
-        var key = "\(endpoint.method.rawValue):\(endpoint.path)"
-        if let params = endpoint.parameters {
-            let sorted = params.keys.sorted().map { "\($0)=\(params[$0]!)" }
-            key += "?" + sorted.joined(separator: "&")
+    /// 生成进程内去重 key。完整 URL 防止跨 host 串请求，响应类型防止共享已解码的异型 Task。
+    static func deduplicationKey<T>(
+        for endpoint: Endpoint<T>,
+        defaultBaseURL: String
+    ) throws -> String {
+        let request = try endpoint.asURLRequest(baseURL: defaultBaseURL)
+        let url = request.url?.absoluteString ?? "invalid-url"
+        let bodyFingerprint = request.httpBody.map(Self.fingerprint) ?? "none"
+        return [
+            endpoint.method.rawValue,
+            url,
+            "body=\(bodyFingerprint)",
+            "signed=\(endpoint.requiresSigning)",
+            "response=\(String(reflecting: T.self))",
+        ].joined(separator: "|")
+    }
+
+    /// 仅用于进程内请求身份，不作为安全哈希；避免把请求正文直接写入日志或诊断 key。
+    private static func fingerprint(_ data: Data) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
         }
-        return key
+        return String(hash, radix: 16)
+    }
+
+    /// 熔断只反映服务/网络可用性；取消、4xx、业务码、无效 URL 和解码错误均不计失败。
+    static func shouldRecordCircuitFailure(_ error: Error) -> Bool {
+        guard let networkError = error as? NetworkError else { return false }
+        switch networkError {
+        case .httpStatus(let code, _, _):
+            return code == 429 || (500...599).contains(code)
+        case .transport(let underlying, _):
+            guard let urlError = underlying as? URLError else { return false }
+            switch urlError.code {
+            case .timedOut,
+                 .cannotFindHost,
+                 .cannotConnectToHost,
+                 .dnsLookupFailed,
+                 .networkConnectionLost,
+                 .notConnectedToInternet,
+                 .internationalRoamingOff,
+                 .callIsActive,
+                 .dataNotAllowed,
+                 .secureConnectionFailed:
+                return true
+            default:
+                return false
+            }
+        case .invalidURL, .serverBusiness, .decoding:
+            return false
+        }
     }
 }

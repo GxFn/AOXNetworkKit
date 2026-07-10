@@ -15,5 +15,9 @@ let package = Package(
             name: "AOXNetworkKit",
             dependencies: ["Alamofire"]
         ),
+        .testTarget(
+            name: "AOXNetworkKitTests",
+            dependencies: ["AOXNetworkKit"]
+        ),
     ]
 )

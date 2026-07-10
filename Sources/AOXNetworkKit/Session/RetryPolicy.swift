@@ -18,7 +18,7 @@ private let logger = Logger(subsystem: "com.networkkit", category: "Retry")
 /// let interceptor = makeInterceptor(retryPolicy: retryPolicy)
 /// let pool = SessionPool(interceptor: interceptor)
 /// ```
-public final class NetworkKitRetryPolicy: RetryPolicy {
+public final class NetworkKitRetryPolicy: RetryPolicy, @unchecked Sendable {
 
     /// 创建 NetworkKit 定制的重试策略
     ///
@@ -47,13 +47,33 @@ public final class NetworkKitRetryPolicy: RetryPolicy {
     }
 
     override public func shouldRetry(request: Request, dueTo error: any Error) -> Bool {
-        // 先检查 NetworkError.isTransient
+        // NetworkError 快捷分支也必须遵守重试上限和幂等方法边界；否则 POST 的瞬态错误会
+        // 绕过 Alamofire 默认策略，产生点赞/评论等重复副作用。
         if let networkError = error as? NetworkError {
-            return networkError.isTransient
+            guard request.retryCount < retryLimit,
+                  let method = request.request?.method,
+                  RetryPolicy.defaultRetryableHTTPMethods.contains(method) else {
+                return false
+            }
+            return Self.shouldRetry(networkError: networkError)
         }
 
         // 回退到 Alamofire 默认判断（HTTP 状态码 + URLError 分类）
         return super.shouldRetry(request: request, dueTo: error)
+    }
+
+    /// 重试与熔断是不同策略：408 值得对幂等请求重试，却不一定代表服务整体故障；
+    /// 取消则两者都不应处理。这里与 Alamofire 默认集合保持一致，不复用熔断分类。
+    static func shouldRetry(networkError: NetworkError) -> Bool {
+        switch networkError {
+        case .httpStatus(let code, _, _):
+            return RetryPolicy.defaultRetryableHTTPStatusCodes.union([429]).contains(code)
+        case .transport(let underlying, _):
+            guard let urlError = underlying as? URLError else { return false }
+            return RetryPolicy.defaultRetryableURLErrorCodes.contains(urlError.code)
+        case .invalidURL, .serverBusiness, .decoding:
+            return false
+        }
     }
 
     override public func retry(
