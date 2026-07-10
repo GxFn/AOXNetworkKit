@@ -136,7 +136,7 @@ public final actor WebSocketClient {
         wsTask.resume()
 
         self.state = .connected
-        logger.info("WebSocket connected: \(self.url.absoluteString)")
+        logger.info("WebSocket transport started: host=\(self.url.host ?? "unknown"), path=\(self.url.path)")
 
         startReceiveLoop()
     }
@@ -201,7 +201,7 @@ public final actor WebSocketClient {
     /// 发送 ping
     public func ping() async throws {
         guard let task, state == .connected else {
-            logger.warning("WebSocket ping skipped: not connected, url=\(self.url.absoluteString)")
+            logger.warning("WebSocket ping skipped: not connected, host=\(self.url.host ?? "unknown"), path=\(self.url.path)")
             throw NetworkError.transport(
                 underlying: URLError(.notConnectedToInternet),
                 requestID: UUID().uuidString

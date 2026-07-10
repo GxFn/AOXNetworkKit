@@ -20,6 +20,7 @@ import Foundation
 ///
 /// - **唯一工厂**：App 内禁止直接创建 `URLSession` 或 `Alamofire.Session`
 /// - **配置统一**：同优先级的 Alamofire Session 和 Delegate Session 共享超时/QoS/缓存策略
+/// - **Cookie 边界统一**：bare、delegate 与 Alamofire Session 使用同一 CookieStorage 策略
 /// - **职责分离**：`RequestPriority` 只用于 Alamofire 请求路由；
 ///   `SessionConfig` 的 `.media`/`.websocket` 预设供 Delegate Session 使用
 public final class SessionPool: Sendable {
@@ -32,6 +33,11 @@ public final class SessionPool: Sendable {
     private let uploadSession: Session
     private let downloadSession: Session
 
+    /// 该会话池统一使用的 HTTP CookieStorage 策略。
+    ///
+    /// 这是 URLSession 传输配置，不持久化业务 Cookie；Cookie 的真实状态仍由上层账号模块管理。
+    public let cookieStoragePolicy: HTTPCookieStoragePolicy
+
     /// 无 Interceptor 的 URLSession，用于基础设施请求（Auth 验证、WBI 密钥获取等）
     private let _bareSession: URLSession
 
@@ -42,6 +48,9 @@ public final class SessionPool: Sendable {
     ///                  组合 Adapter + RetryPolicy。
     ///   - serverTrustManager: SSL 证书信任管理器
     ///   - eventMonitors: Alamofire 事件监听器（如 `NetworkEventMonitor`）
+    ///   - cookieStoragePolicy: 所有会话统一使用的 CookieStorage 策略。默认 `.shared` 保持历史行为；
+    ///                          账号 Cookie 由业务层显式注入时应使用 `.disabled`，避免 URLSession
+    ///                          再从共享 CookieStorage 隐式附加或接收 Cookie。
     ///
     /// ```swift
     /// let interceptor = makeInterceptor(
@@ -58,14 +67,49 @@ public final class SessionPool: Sendable {
         downloadConfig: SessionConfig = .download,
         interceptor: (any RequestInterceptor)? = nil,
         serverTrustManager: ServerTrustManager? = nil,
-        eventMonitors: [any EventMonitor] = []
+        eventMonitors: [any EventMonitor] = [],
+        cookieStoragePolicy: HTTPCookieStoragePolicy = .shared
     ) {
-        self._bareSession = URLSession(configuration: Self.makeURLSessionConfiguration(from: apiConfig))
-        self.apiSession = Self.makeSession(config: apiConfig, interceptor: interceptor, serverTrustManager: serverTrustManager, eventMonitors: eventMonitors)
-        self.liveSession = Self.makeSession(config: liveConfig, interceptor: interceptor, serverTrustManager: serverTrustManager, eventMonitors: eventMonitors)
-        self.prefetchSession = Self.makeSession(config: prefetchConfig, interceptor: interceptor, serverTrustManager: serverTrustManager, eventMonitors: eventMonitors)
-        self.uploadSession = Self.makeSession(config: uploadConfig, interceptor: interceptor, serverTrustManager: serverTrustManager, eventMonitors: eventMonitors)
-        self.downloadSession = Self.makeSession(config: downloadConfig, interceptor: interceptor, serverTrustManager: serverTrustManager, eventMonitors: eventMonitors)
+        self.cookieStoragePolicy = cookieStoragePolicy
+        self._bareSession = URLSession(configuration: Self.makeURLSessionConfiguration(
+            from: apiConfig,
+            cookieStoragePolicy: cookieStoragePolicy
+        ))
+        self.apiSession = Self.makeSession(
+            config: apiConfig,
+            cookieStoragePolicy: cookieStoragePolicy,
+            interceptor: interceptor,
+            serverTrustManager: serverTrustManager,
+            eventMonitors: eventMonitors
+        )
+        self.liveSession = Self.makeSession(
+            config: liveConfig,
+            cookieStoragePolicy: cookieStoragePolicy,
+            interceptor: interceptor,
+            serverTrustManager: serverTrustManager,
+            eventMonitors: eventMonitors
+        )
+        self.prefetchSession = Self.makeSession(
+            config: prefetchConfig,
+            cookieStoragePolicy: cookieStoragePolicy,
+            interceptor: interceptor,
+            serverTrustManager: serverTrustManager,
+            eventMonitors: eventMonitors
+        )
+        self.uploadSession = Self.makeSession(
+            config: uploadConfig,
+            cookieStoragePolicy: cookieStoragePolicy,
+            interceptor: interceptor,
+            serverTrustManager: serverTrustManager,
+            eventMonitors: eventMonitors
+        )
+        self.downloadSession = Self.makeSession(
+            config: downloadConfig,
+            cookieStoragePolicy: cookieStoragePolicy,
+            interceptor: interceptor,
+            serverTrustManager: serverTrustManager,
+            eventMonitors: eventMonitors
+        )
     }
 
     // MARK: - Layer 1: Alamofire Session（带完整中间件链）
@@ -128,7 +172,10 @@ public final class SessionPool: Sendable {
         queue: OperationQueue? = nil
     ) -> URLSession {
         URLSession(
-            configuration: Self.makeURLSessionConfiguration(from: config),
+            configuration: Self.makeURLSessionConfiguration(
+                from: config,
+                cookieStoragePolicy: cookieStoragePolicy
+            ),
             delegate: delegate,
             delegateQueue: queue
         )
@@ -136,7 +183,10 @@ public final class SessionPool: Sendable {
 
     // MARK: - Internal
 
-    private static func makeURLSessionConfiguration(from config: SessionConfig) -> URLSessionConfiguration {
+    private static func makeURLSessionConfiguration(
+        from config: SessionConfig,
+        cookieStoragePolicy: HTTPCookieStoragePolicy
+    ) -> URLSessionConfiguration {
         let urlConfig = URLSessionConfiguration.default
         urlConfig.timeoutIntervalForRequest = config.requestTimeout
         urlConfig.timeoutIntervalForResource = config.resourceTimeout
@@ -145,6 +195,7 @@ public final class SessionPool: Sendable {
         urlConfig.waitsForConnectivity = config.waitsForConnectivity
         urlConfig.requestCachePolicy = config.cachePolicy
         urlConfig.allowsConstrainedNetworkAccess = config.allowsConstrainedNetworkAccess
+        cookieStoragePolicy.apply(to: urlConfig)
 
         if config.cachePolicy == .reloadIgnoringLocalCacheData {
             urlConfig.urlCache = nil
@@ -155,16 +206,59 @@ public final class SessionPool: Sendable {
 
     private static func makeSession(
         config: SessionConfig,
+        cookieStoragePolicy: HTTPCookieStoragePolicy,
         interceptor: (any RequestInterceptor)? = nil,
         serverTrustManager: ServerTrustManager? = nil,
         eventMonitors: [any EventMonitor] = []
     ) -> Session {
         Session(
-            configuration: makeURLSessionConfiguration(from: config),
+            configuration: makeURLSessionConfiguration(
+                from: config,
+                cookieStoragePolicy: cookieStoragePolicy
+            ),
             interceptor: interceptor,
             serverTrustManager: serverTrustManager,
             eventMonitors: eventMonitors
         )
+    }
+}
+
+// MARK: - HTTP Cookie Storage Policy
+
+/// URLSession 自动 CookieStorage 的使用策略。
+///
+/// 该类型只控制传输层是否从 CookieStorage 自动读取、向 CookieStorage 自动写入 Cookie，
+/// 不负责业务 Cookie 的持久化，也不会影响调用方显式设置的 `Cookie` 请求头。
+public enum HTTPCookieStoragePolicy: Sendable {
+    /// 使用进程共享的 `HTTPCookieStorage.shared`。
+    ///
+    /// 这是 `URLSessionConfiguration.default` 的历史行为，也是 SessionPool 的默认值，
+    /// 用于保持现有 AOXNetworkKit 消费方兼容。
+    case shared
+
+    /// 完全禁用 URLSession 的自动 CookieStorage 行为。
+    ///
+    /// 适用于由账号模块集中管理 Cookie、网络层仅显式注入 Header 的应用，避免共享存储中的
+    /// 旧 Cookie 或跨域 Cookie 被 URLSession 隐式附加。
+    case disabled
+
+    /// 使用调用方提供的隔离 CookieStorage，例如 App Group 专属存储。
+    case custom(HTTPCookieStorage)
+
+    fileprivate func apply(to configuration: URLSessionConfiguration) {
+        switch self {
+        case .shared:
+            configuration.httpShouldSetCookies = true
+            configuration.httpCookieStorage = .shared
+
+        case .disabled:
+            configuration.httpShouldSetCookies = false
+            configuration.httpCookieStorage = nil
+
+        case .custom(let storage):
+            configuration.httpShouldSetCookies = true
+            configuration.httpCookieStorage = storage
+        }
     }
 }
 
