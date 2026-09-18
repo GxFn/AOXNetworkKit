@@ -33,7 +33,7 @@ public protocol NetworkClientProtocol: Sendable {
 /// > Session 级别的 `MiddlewareAdapter` 会创建临时 Context，缺少 `requiresSigning` 等元数据。
 ///
 /// ```
-/// send() → cache check → CB preCheck → dedup
+/// send() → cache check → dedup → CB preCheck
 ///     ↓
 /// execute() → adapt pipeline → Alamofire Session → didReceive pipeline → decode
 ///                                                        ↑ business recover
@@ -73,10 +73,7 @@ public struct NetworkClient: NetworkClientProtocol {
             return cached
         }
 
-        // 2. 熔断器预检 → 快速失败
-        try circuitBreaker?.preCheck()
-
-        // 3. 执行请求（支持去重）。RequestContext 和缓存策略必须只由真正发网的 leader 创建；
+        // 2. 执行请求（支持去重）。熔断许可、RequestContext 和缓存策略只由真正的 leader 创建；
         // follower 若提前注册 side-table，会因为没有 didReceive 永久残留。
         if let deduplicator {
             return try await deduplicator.deduplicate(
@@ -103,16 +100,23 @@ public struct NetworkClient: NetworkClientProtocol {
         _ endpoint: Endpoint<T>,
         context: RequestContext
     ) async throws -> T {
+        // 预检必须在真实 leader 的完整生命周期内；去重 key 构造失败或 follower
+        // 不应消耗 half-open 额度，所有成功/失败/取消出口都必须结算对应许可。
+        let permit = try circuitBreaker?.beginRequest()
         do {
             let result = try await execute(endpoint, context: context)
-            circuitBreaker?.recordSuccess()
+            if let permit { circuitBreaker?.recordSuccess(for: permit) }
             return result
         } catch is CancellationError {
-            // 调用方主动取消不是服务故障，不能消耗熔断预算。
+            if let permit { circuitBreaker?.recordIgnored(for: permit) }
             throw CancellationError()
         } catch {
-            if Self.shouldRecordCircuitFailure(error) {
-                circuitBreaker?.recordFailure()
+            if let permit {
+                if Self.shouldRecordCircuitFailure(error) {
+                    circuitBreaker?.recordFailure(for: permit)
+                } else {
+                    circuitBreaker?.recordIgnored(for: permit)
+                }
             }
             throw error
         }
@@ -242,7 +246,7 @@ public struct NetworkClient: NetworkClientProtocol {
     private func checkCache<T: Decodable & Sendable>(for endpoint: Endpoint<T>) -> T? {
         guard endpoint.method == .get, case .memory = endpoint.cachePolicy else { return nil }
         guard let cache = middlewares.lazy.compactMap({ $0 as? CacheMiddleware }).first else { return nil }
-        // 缓存写入使用 HTTPURLResponse.url（包含 query）；读取必须使用同一规范化 URL。
+        // 读写都使用进入签名/改写中间件之前的完整请求身份（含 host 与 query）。
         guard let url = try? endpoint.asURLRequest(baseURL: defaultBaseURL).url else { return nil }
         guard let data = cache.cachedData(for: url) else { return nil }
         let context = RequestContext(endpoint: endpoint)
@@ -253,7 +257,12 @@ public struct NetworkClient: NetworkClientProtocol {
     private func registerCachePolicy<T>(_ endpoint: Endpoint<T>, context: RequestContext) {
         guard endpoint.method == .get, case .memory = endpoint.cachePolicy else { return }
         guard let cache = middlewares.lazy.compactMap({ $0 as? CacheMiddleware }).first else { return }
-        cache.registerPolicy(endpoint.cachePolicy, for: context.id)
+        guard let url = try? endpoint.asURLRequest(baseURL: defaultBaseURL).url else { return }
+        cache.registerPolicy(
+            endpoint.cachePolicy,
+            for: context.id,
+            cacheKey: CacheMiddleware.cacheKey(for: url)
+        )
     }
 
     private func unregisterCachePolicy(context: RequestContext) {

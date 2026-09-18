@@ -99,14 +99,14 @@ public final class MockClient: NetworkClientProtocol, @unchecked Sendable {
             timestamp: Date()
         )
 
-        // 记录请求 + 查找匹配 stub 在同一个 lock 区间
-        let mockResponse: MockResponse? = state.withLock { s in
+        // 锁内原子记录并选择规则，锁外执行用户 factory。factory 可能读取 requests 或
+        // 更新 fallback；在非递归 unfair lock 内调用会重入同一把锁并触发运行时异常。
+        let selection: (factory: (@Sendable (String) -> MockResponse)?, fallback: MockResponse?) = state.withLock { s in
             s.requests.append(record)
-            for stub in s.stubs where endpoint.path.contains(stub.pattern) {
-                return stub.factory(endpoint.path)
-            }
-            return s.fallback
+            let factory = s.stubs.first { endpoint.path.contains($0.pattern) }?.factory
+            return (factory, s.fallback)
         }
+        let mockResponse = selection.factory?(endpoint.path) ?? selection.fallback
 
         guard let mockResponse else {
             throw NetworkError.invalidURL("No stub for path: \(endpoint.path)")

@@ -35,9 +35,13 @@ public final class CacheMiddleware: Middleware, @unchecked Sendable {
     private let defaultTTL: TimeInterval
     private let cache = NSCache<NSString, CacheEntry>()
 
-    /// 当前请求的缓存策略查询回调（由 NetworkClient 注入）
-    /// 保存 context.path → CachePolicy 映射，用于 didReceive 判断是否缓存
-    private let pendingPolicies = OSAllocatedUnfairLock(initialState: [String: CachePolicy]())
+    private struct PendingPolicy: Sendable {
+        let policy: CachePolicy
+        let cacheKey: String?
+    }
+
+    /// context.id 绑定稳定的请求身份；签名/redirect 改写 URL 后，仍与发送前缓存读取共用 key。
+    private let pendingPolicies = OSAllocatedUnfairLock(initialState: [String: PendingPolicy]())
 
     public init(defaultTTL: TimeInterval = 60, maxEntries: Int = 100) {
         self.defaultTTL = defaultTTL
@@ -57,19 +61,19 @@ public final class CacheMiddleware: Middleware, @unchecked Sendable {
         }
 
         // 获取此请求注册的缓存策略
-        let policy: CachePolicy? = pendingPolicies.withLock { policies in
+        let pendingPolicy = pendingPolicies.withLock { policies in
             policies.removeValue(forKey: context.id)
         }
 
         let ttl: TimeInterval?
-        switch policy {
+        switch pendingPolicy?.policy {
         case .memory(let t):
             ttl = t
         case .some(.none), nil:
             return data
         }
 
-        let key = Self.cacheKey(for: url)
+        let key = pendingPolicy?.cacheKey ?? Self.cacheKey(for: url)
         let entry = CacheEntry(data: data, expiresAt: Date().addingTimeInterval(ttl ?? defaultTTL))
         cache.setObject(entry, forKey: key as NSString)
         logger.debug("Cache stored: \(context.path) (TTL=\(ttl ?? self.defaultTTL)s)")
@@ -80,9 +84,11 @@ public final class CacheMiddleware: Middleware, @unchecked Sendable {
     // MARK: - Public API
 
     /// 注册请求的缓存策略（由 NetworkClient 在发送前调用）
-    public func registerPolicy(_ policy: CachePolicy, for contextID: String) {
+    public func registerPolicy(_ policy: CachePolicy, for contextID: String, cacheKey: String? = nil) {
         guard case .memory = policy else { return }
-        pendingPolicies.withLock { $0[contextID] = policy }
+        pendingPolicies.withLock {
+            $0[contextID] = PendingPolicy(policy: policy, cacheKey: cacheKey)
+        }
     }
 
     /// 请求无论成功、失败还是取消都由 NetworkClient defer 调用；成功路径可重复移除，保持幂等。
